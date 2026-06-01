@@ -1,0 +1,430 @@
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { supabase } from '@/db/supabase';
+import { useAuth } from '@/contexts/AuthContext';
+import MainLayout from '@/components/layouts/MainLayout';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  AlertTriangle, Building2, CheckCircle2, TrendingUp, Clock,
+  Shield, Search, Eye, ArrowRight, Bell, LayoutDashboard,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import {
+  type Property, type PropertyAlert, type PropertyStatus,
+  STATUS_LABELS, STATUS_ORDER,
+} from '@/types/types';
+import { getStatusColor, getAlertSeverityColor, getImpactScoreColor, formatDate } from '@/lib/utils-app';
+
+export default function AdminDashboard() {
+  const { profile, loading: authLoading } = useAuth();
+  const navigate = useNavigate();
+
+  const [properties, setProperties] = useState<Property[]>([]);
+  const [alerts, setAlerts] = useState<PropertyAlert[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [statusNote, setStatusNote] = useState('');
+
+  useEffect(() => {
+    if (!authLoading) {
+      if (!profile || profile.role !== 'admin') {
+        toast.error('Admin access required.');
+        navigate('/');
+        return;
+      }
+      loadData();
+    }
+  }, [profile, authLoading]);
+
+  const loadData = async () => {
+    setLoading(true);
+    const [{ data: props }, { data: alertData }] = await Promise.all([
+      supabase
+        .from('properties')
+        .select('*, property_images(id, image_url), property_alerts(id, title, severity, is_resolved)')
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('property_alerts')
+        .select('*, property:properties(id, address)')
+        .eq('is_resolved', false)
+        .order('created_at', { ascending: false }),
+    ]);
+    setProperties(Array.isArray(props) ? props : []);
+    setAlerts(Array.isArray(alertData) ? alertData : []);
+    setLoading(false);
+  };
+
+  const updateStatus = async (propertyId: string, currentStatus: PropertyStatus, newStatus: PropertyStatus) => {
+    setUpdatingId(propertyId);
+    try {
+      const { error } = await supabase
+        .from('properties')
+        .update({ status: newStatus })
+        .eq('id', propertyId);
+      if (error) throw error;
+
+      await supabase.from('property_status_history').insert({
+        property_id: propertyId,
+        old_status: currentStatus,
+        new_status: newStatus,
+        changed_by: profile?.id,
+        notes: statusNote || null,
+      });
+
+      setProperties(prev => prev.map(p => p.id === propertyId ? { ...p, status: newStatus } : p));
+      setStatusNote('');
+      toast.success(`Status updated to "${STATUS_LABELS[newStatus]}".`);
+    } catch (err) {
+      toast.error(`Update failed: ${(err as Error).message}`);
+    } finally {
+      setUpdatingId(null);
+    }
+  };
+
+  const resolveAlert = async (alertId: string) => {
+    const { error } = await supabase.from('property_alerts').update({ is_resolved: true }).eq('id', alertId);
+    if (!error) {
+      setAlerts(prev => prev.filter(a => a.id !== alertId));
+      toast.success('Alert resolved.');
+    }
+  };
+
+  const filtered = properties.filter(p => {
+    const matchSearch = !search || p.address.toLowerCase().includes(search.toLowerCase());
+    const matchStatus = statusFilter === 'all' || p.status === statusFilter;
+    return matchSearch && matchStatus;
+  });
+
+  // Stats
+  const stats = {
+    total: properties.length,
+    verified: properties.filter(p => ['verified_vacant', 'notice_sent', 'owner_response', 'action_recommended'].includes(p.status)).length,
+    pending: properties.filter(p => ['reported', 'under_verification'].includes(p.status)).length,
+    actions: properties.filter(p => p.status === 'action_recommended').length,
+    activeAlerts: alerts.length,
+  };
+
+  // Status distribution for heatmap-style display
+  const statusDist = STATUS_ORDER.map(s => ({
+    status: s,
+    count: properties.filter(p => p.status === s).length,
+  }));
+  const maxCount = Math.max(...statusDist.map(d => d.count), 1);
+
+  if (authLoading || loading) {
+    return (
+      <MainLayout>
+        <div className="max-w-6xl mx-auto px-4 md:px-8 py-8 space-y-4">
+          <Skeleton className="h-8 w-48 bg-muted" />
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            {[...Array(5)].map((_, i) => <Skeleton key={i} className="h-24 bg-muted" />)}
+          </div>
+          <Skeleton className="h-96 bg-muted" />
+        </div>
+      </MainLayout>
+    );
+  }
+
+  return (
+    <MainLayout>
+      <div className="max-w-6xl mx-auto px-4 md:px-8 py-6 space-y-6">
+        {/* Header */}
+        <div className="flex items-center gap-3">
+          <LayoutDashboard className="w-6 h-6 text-primary shrink-0" />
+          <div>
+            <h1 className="text-xl font-bold text-foreground text-balance">Admin Dashboard</h1>
+            <p className="text-sm text-muted-foreground">District administration — property management</p>
+          </div>
+          {stats.activeAlerts > 0 && (
+            <Badge className="ml-auto bg-red-100 text-red-800 border-red-200 gap-1.5 shrink-0">
+              <Bell className="w-3.5 h-3.5" />
+              {stats.activeAlerts} Active Alert{stats.activeAlerts !== 1 ? 's' : ''}
+            </Badge>
+          )}
+        </div>
+
+        {/* Stats */}
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          {[
+            { label: 'Total Reports', value: stats.total, icon: Building2, cls: 'text-primary bg-primary/10' },
+            { label: 'Pending Review', value: stats.pending, icon: Clock, cls: 'text-yellow-700 bg-yellow-100' },
+            { label: 'Verified', value: stats.verified, icon: CheckCircle2, cls: 'text-green-700 bg-green-100' },
+            { label: 'Action Taken', value: stats.actions, icon: TrendingUp, cls: 'text-orange-700 bg-orange-100' },
+            { label: 'Active Alerts', value: stats.activeAlerts, icon: AlertTriangle, cls: 'text-red-700 bg-red-100' },
+          ].map(({ label, value, icon: Icon, cls }) => (
+            <Card key={label} className="h-full border border-border">
+              <CardContent className="p-4 flex items-start gap-3">
+                <div className={`w-9 h-9 rounded flex items-center justify-center shrink-0 ${cls}`}>
+                  <Icon className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xl font-bold text-foreground">{value}</p>
+                  <p className="text-xs text-muted-foreground text-balance">{label}</p>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+
+        {/* Status Distribution */}
+        <Card className="border border-border">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base text-balance">Status Distribution</CardTitle>
+          </CardHeader>
+          <CardContent className="p-4 pt-0">
+            <div className="space-y-2">
+              {statusDist.map(({ status, count }) => (
+                <div key={status} className="flex items-center gap-3">
+                  <span className="text-xs text-muted-foreground w-36 shrink-0 text-balance">{STATUS_LABELS[status]}</span>
+                  <div className="flex-1 bg-muted rounded-full h-2 overflow-hidden">
+                    <div
+                      className="h-2 rounded-full bg-primary transition-all"
+                      style={{ width: `${(count / maxCount) * 100}%` }}
+                    />
+                  </div>
+                  <span className="text-xs font-semibold text-foreground w-6 text-right shrink-0">{count}</span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Tabs */}
+        <Tabs defaultValue="reports">
+          <TabsList>
+            <TabsTrigger value="reports">All Reports</TabsTrigger>
+            <TabsTrigger value="alerts" className="gap-2">
+              Alerts
+              {stats.activeAlerts > 0 && (
+                <Badge className="text-[10px] h-4 bg-red-100 text-red-800 border-0 px-1.5">{stats.activeAlerts}</Badge>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="priority">High Priority</TabsTrigger>
+          </TabsList>
+
+          {/* Reports Tab */}
+          <TabsContent value="reports" className="mt-4">
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <div className="flex flex-col md:flex-row gap-3">
+                  <div className="relative flex-1 min-w-0">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                    <Input
+                      className="pl-9"
+                      placeholder="Search by address…"
+                      value={search}
+                      onChange={e => setSearch(e.target.value)}
+                    />
+                  </div>
+                  <Select value={statusFilter} onValueChange={setStatusFilter}>
+                    <SelectTrigger className="w-full md:w-44 shrink-0">
+                      <SelectValue placeholder="Filter Status" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All Statuses</SelectItem>
+                      {(Object.keys(STATUS_LABELS) as PropertyStatus[]).map(s => (
+                        <SelectItem key={s} value={s}>{STATUS_LABELS[s]}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </CardHeader>
+              <CardContent className="p-0">
+                <div className="overflow-x-auto w-full">
+                  <table className="w-full min-w-max">
+                    <thead>
+                      <tr className="border-b border-border bg-muted/50">
+                        <th className="text-left text-xs font-semibold text-muted-foreground px-4 py-3 whitespace-nowrap">Address</th>
+                        <th className="text-left text-xs font-semibold text-muted-foreground px-4 py-3 whitespace-nowrap">Status</th>
+                        <th className="text-left text-xs font-semibold text-muted-foreground px-4 py-3 whitespace-nowrap">Score</th>
+                        <th className="text-left text-xs font-semibold text-muted-foreground px-4 py-3 whitespace-nowrap">Reported</th>
+                        <th className="text-left text-xs font-semibold text-muted-foreground px-4 py-3 whitespace-nowrap">Update Status</th>
+                        <th className="text-left text-xs font-semibold text-muted-foreground px-4 py-3 whitespace-nowrap">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="text-center py-8 text-muted-foreground text-sm">No properties found.</td>
+                        </tr>
+                      ) : filtered.map(p => {
+                        const currentIdx = STATUS_ORDER.indexOf(p.status);
+                        const nextStatuses = STATUS_ORDER.slice(currentIdx + 1);
+                        return (
+                          <tr key={p.id} className="border-b border-border hover:bg-muted/30 transition-colors">
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <div className="max-w-[220px]">
+                                <p className="text-sm font-medium text-foreground truncate">{p.address}</p>
+                                <p className="text-xs text-muted-foreground capitalize">{p.property_type}</p>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <Badge className={`text-xs border ${getStatusColor(p.status)}`}>
+                                {STATUS_LABELS[p.status]}
+                              </Badge>
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <span className={`text-sm font-bold ${getImpactScoreColor(p.impact_score)}`}>
+                                {p.impact_score}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap text-xs text-muted-foreground">
+                              {formatDate(p.created_at)}
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              {nextStatuses.length > 0 ? (
+                                <Select
+                                  disabled={updatingId === p.id}
+                                  onValueChange={val => updateStatus(p.id, p.status, val as PropertyStatus)}
+                                >
+                                  <SelectTrigger className="h-8 text-xs w-44">
+                                    <SelectValue placeholder="Advance status…" />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {nextStatuses.map(s => (
+                                      <SelectItem key={s} value={s}>{STATUS_LABELS[s]}</SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">Final status</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 gap-1.5 text-xs"
+                                onClick={() => navigate(`/property/${p.id}`)}
+                              >
+                                <Eye className="w-3.5 h-3.5" /> View
+                              </Button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* Alerts Tab */}
+          <TabsContent value="alerts" className="mt-4">
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base text-balance">Active Alerts</CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0">
+                {alerts.length === 0 ? (
+                  <div className="text-center py-8">
+                    <Shield className="w-8 h-8 text-muted-foreground mx-auto mb-2" />
+                    <p className="text-sm text-muted-foreground">No active alerts. All clear!</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {alerts.map(alert => (
+                      <div key={alert.id} className="flex items-start gap-3 p-3 border border-border rounded">
+                        <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${
+                          alert.severity === 'high' ? 'text-red-600' :
+                          alert.severity === 'medium' ? 'text-orange-500' : 'text-yellow-500'
+                        }`} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <p className="text-sm font-medium text-foreground text-balance">{alert.title}</p>
+                            <Badge className={`text-xs border ${getAlertSeverityColor(alert.severity)} shrink-0`}>
+                              {alert.severity}
+                            </Badge>
+                          </div>
+                          {alert.description && (
+                            <p className="text-xs text-muted-foreground mt-0.5 text-pretty">{alert.description}</p>
+                          )}
+                          {(alert.property as any)?.address && (
+                            <p className="text-xs text-muted-foreground mt-0.5 truncate">
+                              📍 {(alert.property as any).address}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {(alert.property as any)?.id && (
+                            <Button variant="ghost" size="sm" className="h-8 gap-1 text-xs"
+                              onClick={() => navigate(`/property/${(alert.property as any).id}`)}>
+                              <ArrowRight className="w-3.5 h-3.5" />
+                            </Button>
+                          )}
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-8 text-xs"
+                            onClick={() => resolveAlert(alert.id)}
+                          >
+                            Resolve
+                          </Button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* High Priority Tab */}
+          <TabsContent value="priority" className="mt-4">
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base text-balance">High Priority Properties (Score ≥ 75)</CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0">
+                <div className="space-y-3">
+                  {properties
+                    .filter(p => p.impact_score >= 75)
+                    .sort((a, b) => b.impact_score - a.impact_score)
+                    .map((p, i) => (
+                      <div key={p.id} className="flex items-center gap-3 p-3 border border-border rounded hover:border-primary/40 transition-colors">
+                        <span className="text-sm font-bold text-muted-foreground w-6 shrink-0">#{i + 1}</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-foreground truncate">{p.address}</p>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <Badge className={`text-xs border ${getStatusColor(p.status)}`}>
+                              {STATUS_LABELS[p.status]}
+                            </Badge>
+                            <span className="text-xs text-muted-foreground capitalize">{p.property_type}</span>
+                          </div>
+                        </div>
+                        <div className="text-right shrink-0">
+                          <p className={`text-lg font-bold ${getImpactScoreColor(p.impact_score)}`}>{p.impact_score}</p>
+                          <p className="text-xs text-muted-foreground">score</p>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="shrink-0 h-8 w-8"
+                          onClick={() => navigate(`/property/${p.id}`)}
+                        >
+                          <Eye className="w-4 h-4" />
+                        </Button>
+                      </div>
+                    ))}
+                  {properties.filter(p => p.impact_score >= 75).length === 0 && (
+                    <p className="text-sm text-muted-foreground text-center py-6">No high priority properties at this time.</p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+    </MainLayout>
+  );
+}

@@ -1,0 +1,245 @@
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { supabase } from '@/db/supabase';
+import { useAuth } from '@/contexts/AuthContext';
+import MainLayout from '@/components/layouts/MainLayout';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Building2, Map, Plus, AlertTriangle, CheckCircle2,
+  TrendingUp, ArrowRight, MapPin, Clock, Shield,
+} from 'lucide-react';
+import { STATUS_LABELS, type Property } from '@/types/types';
+import { getStatusColor, getImpactScoreColor, formatDate } from '@/lib/utils-app';
+
+interface Stats {
+  total: number;
+  verified: number;
+  actionTaken: number;
+  highPriority: number;
+}
+
+function StatCard({ label, value, icon: Icon, color }: { label: string; value: number; icon: React.ElementType; color: string }) {
+  return (
+    <Card className="h-full border border-border">
+      <CardContent className="p-5 flex items-start gap-4">
+        <div className={`w-10 h-10 rounded flex items-center justify-center shrink-0 ${color}`}>
+          <Icon className="w-5 h-5" />
+        </div>
+        <div className="min-w-0">
+          <p className="text-2xl font-bold text-foreground">{value.toLocaleString()}</p>
+          <p className="text-sm text-muted-foreground text-pretty">{label}</p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PropertyCard({ property }: { property: Property }) {
+  const navigate = useNavigate();
+  return (
+    <Card
+      className="h-full flex flex-col border border-border hover:border-primary/40 transition-colors cursor-pointer"
+      onClick={() => navigate(`/property/${property.id}`)}
+    >
+      <CardContent className="p-4 flex flex-col flex-1 gap-3">
+        <div className="flex items-start justify-between gap-2">
+          <Badge className={`text-xs border ${getStatusColor(property.status)} shrink-0`}>
+            {STATUS_LABELS[property.status]}
+          </Badge>
+          <span className={`text-sm font-bold shrink-0 ${getImpactScoreColor(property.impact_score)}`}>
+            {property.impact_score}
+          </span>
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="font-medium text-sm text-foreground text-balance line-clamp-2">{property.address}</p>
+          <div className="flex items-center gap-1 mt-1 text-xs text-muted-foreground">
+            <MapPin className="w-3 h-3 shrink-0" />
+            <span className="truncate capitalize">{property.property_type}</span>
+            {property.years_unused && (
+              <>
+                <span className="mx-1">·</span>
+                <Clock className="w-3 h-3 shrink-0" />
+                <span>{property.years_unused}yr{property.years_unused !== 1 ? 's' : ''} unused</span>
+              </>
+            )}
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground mt-auto shrink-0">{formatDate(property.created_at)}</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+export default function HomePage() {
+  const { profile } = useAuth();
+  const navigate = useNavigate();
+  const [stats, setStats] = useState<Stats>({ total: 0, verified: 0, actionTaken: 0, highPriority: 0 });
+  const [recentProperties, setRecentProperties] = useState<Property[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function fetchData() {
+      const [{ data: properties }, { data: actionProps }, { data: highProps }] = await Promise.all([
+        supabase.from('properties').select('id, status').order('created_at', { ascending: false }),
+        supabase.from('properties').select('id').eq('status', 'action_recommended'),
+        supabase.from('properties').select('id').gte('impact_score', 75),
+      ]);
+
+      const all = properties || [];
+      const verified = all.filter(p => ['verified_vacant', 'notice_sent', 'owner_response', 'action_recommended'].includes(p.status));
+
+      setStats({
+        total: all.length,
+        verified: verified.length,
+        actionTaken: (actionProps || []).length,
+        highPriority: (highProps || []).length,
+      });
+
+      const { data: recent } = await supabase
+        .from('properties')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(6);
+
+      setRecentProperties(Array.isArray(recent) ? recent : []);
+      setLoading(false);
+    }
+    fetchData();
+  }, []);
+
+  return (
+    <MainLayout>
+      {/* Hero */}
+      <div className="bg-sidebar border-b border-sidebar-border">
+        <div className="max-w-5xl mx-auto px-4 md:px-8 py-10 md:py-16">
+          <div className="flex flex-col md:flex-row md:items-center gap-6 md:gap-10">
+            <div className="flex-1 min-w-0">
+              <div className="inline-flex items-center gap-2 bg-sidebar-accent text-sidebar-primary rounded px-3 py-1 text-xs font-semibold mb-4 border border-sidebar-border">
+                <Shield className="w-3.5 h-3.5" />
+                Civic-Powered Platform
+              </div>
+              <h1 className="text-2xl md:text-4xl font-bold text-sidebar-foreground mb-3 text-balance leading-tight">
+                Every Abandoned Building Is a Missed Opportunity
+              </h1>
+              <p className="text-sm md:text-base text-sidebar-foreground/70 text-pretty max-w-prose">
+                ReviveSpace helps communities identify, verify, and repurpose unused properties
+                for public benefit — turning urban blight into community assets.
+              </p>
+              <div className="flex flex-wrap gap-3 mt-6">
+                <Button
+                  size="lg"
+                  className="bg-[hsl(var(--alert-orange))] hover:bg-[hsl(22,87%,40%)] text-white gap-2"
+                  onClick={() => navigate('/report')}
+                >
+                  <Plus className="w-4 h-4" />
+                  Report a Property
+                </Button>
+                <Button
+                  size="lg"
+                  variant="ghost"
+                  className="border border-sidebar-foreground/30 text-sidebar-foreground hover:bg-sidebar-accent gap-2"
+                  onClick={() => navigate('/map')}
+                >
+                  <Map className="w-4 h-4" />
+                  Explore Map
+                </Button>
+              </div>
+            </div>
+            <div className="hidden md:flex flex-col items-center gap-2 shrink-0">
+              <div className="w-32 h-32 rounded bg-sidebar-accent border border-sidebar-border flex items-center justify-center">
+                <Building2 className="w-16 h-16 text-sidebar-primary" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="max-w-5xl mx-auto px-4 md:px-8 py-8 space-y-10">
+        {/* Stats */}
+        <section>
+          <h2 className="text-lg font-semibold text-foreground mb-4 text-balance">Platform Impact</h2>
+          {loading ? (
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              {[...Array(4)].map((_, i) => <Skeleton key={i} className="h-24 bg-muted" />)}
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <StatCard label="Total Reports" value={stats.total} icon={Building2} color="bg-primary/10 text-primary" />
+              <StatCard label="Verified Vacant" value={stats.verified} icon={CheckCircle2} color="bg-green-100 text-green-700" />
+              <StatCard label="Actions Taken" value={stats.actionTaken} icon={TrendingUp} color="bg-orange-100 text-orange-700" />
+              <StatCard label="High Priority" value={stats.highPriority} icon={AlertTriangle} color="bg-red-100 text-red-700" />
+            </div>
+          )}
+        </section>
+
+        {/* How it works */}
+        <section>
+          <h2 className="text-lg font-semibold text-foreground mb-4 text-balance">How It Works</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {[
+              { step: '01', title: 'Citizens Report', desc: 'Upload photos, mark location, and describe the abandoned property in your neighborhood.', icon: MapPin },
+              { step: '02', title: 'AI Verifies', desc: 'Our AI analyzes images to detect signs of abandonment and generates a confidence score.', icon: Shield },
+              { step: '03', title: 'Government Acts', desc: 'Authorities verify, notify owners, and work with the community to repurpose the space.', icon: TrendingUp },
+            ].map(({ step, title, desc, icon: Icon }) => (
+              <Card key={step} className="h-full border border-border">
+                <CardContent className="p-5 flex flex-col h-full">
+                  <div className="flex items-center gap-3 mb-3">
+                    <span className="text-xs font-bold text-primary bg-primary/10 px-2 py-1 rounded">{step}</span>
+                    <Icon className="w-4 h-4 text-muted-foreground" />
+                  </div>
+                  <h3 className="font-semibold text-foreground mb-1 text-balance">{title}</h3>
+                  <p className="text-sm text-muted-foreground text-pretty flex-1">{desc}</p>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </section>
+
+        {/* Recent Reports */}
+        <section>
+          <div className="flex items-center justify-between mb-4 gap-2">
+            <h2 className="text-lg font-semibold text-foreground text-balance">Recent Reports</h2>
+            <Link to="/map" className="flex items-center gap-1 text-sm text-primary hover:underline shrink-0">
+              View all <ArrowRight className="w-3.5 h-3.5" />
+            </Link>
+          </div>
+          {loading ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {[...Array(6)].map((_, i) => <Skeleton key={i} className="h-32 bg-muted" />)}
+            </div>
+          ) : recentProperties.length === 0 ? (
+            <Card className="border border-border">
+              <CardContent className="p-10 text-center">
+                <Building2 className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
+                <p className="text-muted-foreground">No reports yet. Be the first to report an abandoned property!</p>
+                <Button className="mt-4" onClick={() => navigate('/report')}>
+                  <Plus className="w-4 h-4 mr-2" /> Report Property
+                </Button>
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {recentProperties.map(p => <PropertyCard key={p.id} property={p} />)}
+            </div>
+          )}
+        </section>
+
+        {/* CTA for guests */}
+        {!profile && (
+          <section className="bg-primary/5 border border-primary/20 rounded-lg p-6 text-center">
+            <h3 className="font-semibold text-foreground mb-2 text-balance">Join the Movement</h3>
+            <p className="text-sm text-muted-foreground mb-4 text-pretty max-w-prose mx-auto">
+              Create a free account to report properties, vote on community uses, and track the impact of your contributions.
+            </p>
+            <Button onClick={() => navigate('/login')}>
+              Get Started Free
+            </Button>
+          </section>
+        )}
+      </div>
+    </MainLayout>
+  );
+}
