@@ -1,0 +1,560 @@
+import { useEffect, useState } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { supabase } from '@/db/supabase';
+import { useAuth } from '@/contexts/AuthContext';
+import MainLayout from '@/components/layouts/MainLayout';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Textarea } from '@/components/ui/textarea';
+import { Separator } from '@/components/ui/separator';
+import {
+  MapPin, Calendar, AlertTriangle, Shield, CheckCircle2,
+  MessageSquare, ThumbsUp, ArrowLeft, Clock, Building2, User,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import {
+  type Property, type PropertyStatusHistory, type PropertyComment,
+  type VoteOption, STATUS_LABELS, STATUS_ORDER, VOTE_OPTION_LABELS,
+  SAFETY_CONCERN_LABELS,
+} from '@/types/types';
+import {
+  getStatusColor, getStatusDotColor, getImpactScoreColor,
+  getConditionColor, formatDate, formatDateTime,
+} from '@/lib/utils-app';
+import { MapContainer, TileLayer, CircleMarker } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+
+const VOTE_OPTIONS = Object.keys(VOTE_OPTION_LABELS) as VoteOption[];
+
+export default function PropertyDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  const [property, setProperty] = useState<Property | null>(null);
+  const [history, setHistory] = useState<PropertyStatusHistory[]>([]);
+  const [comments, setComments] = useState<PropertyComment[]>([]);
+  const [votes, setVotes] = useState<Record<string, number>>({});
+  const [userVote, setUserVote] = useState<VoteOption | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [commenting, setCommenting] = useState(false);
+  const [commentText, setCommentText] = useState('');
+  const [votingFor, setVotingFor] = useState<VoteOption | null>(null);
+
+  useEffect(() => {
+    if (!id) return;
+    loadAll();
+  }, [id]);
+
+  const loadAll = async () => {
+    setLoading(true);
+    const [
+      { data: prop },
+      { data: hist },
+      { data: cmts },
+      { data: voteData },
+    ] = await Promise.all([
+      supabase
+        .from('properties')
+        .select('*, property_images(id, image_url), property_alerts(id, title, severity, is_resolved)')
+        .eq('id', id!)
+        .maybeSingle(),
+      supabase
+        .from('property_status_history')
+        .select('*')
+        .eq('property_id', id!)
+        .order('created_at', { ascending: true }),
+      supabase
+        .from('property_comments')
+        .select('*, author:profiles(id, username, role)')
+        .eq('property_id', id!)
+        .order('created_at', { ascending: true }),
+      supabase
+        .from('property_votes')
+        .select('vote_option, voter_id')
+        .eq('property_id', id!),
+    ]);
+
+    setProperty(prop);
+    setHistory(Array.isArray(hist) ? hist : []);
+    setComments(Array.isArray(cmts) ? cmts : []);
+
+    // Tally votes
+    const tally: Record<string, number> = {};
+    const voteList = Array.isArray(voteData) ? voteData : [];
+    for (const v of voteList) {
+      tally[v.vote_option] = (tally[v.vote_option] || 0) + 1;
+    }
+    setVotes(tally);
+
+    // Find user's vote
+    if (user) {
+      const mine = voteList.find(v => v.voter_id === user.id);
+      setUserVote(mine?.vote_option ?? null);
+    }
+    setLoading(false);
+  };
+
+  const handleVote = async (option: VoteOption) => {
+    if (!user) { toast.error('Sign in to vote.'); navigate('/login'); return; }
+    if (!property || !['verified_vacant', 'notice_sent', 'owner_response', 'action_recommended'].includes(property.status)) {
+      toast.error('Voting is only available for verified properties.'); return;
+    }
+    setVotingFor(option);
+    try {
+      if (userVote === option) {
+        // Remove vote
+        await supabase.from('property_votes').delete().match({ property_id: id, voter_id: user.id });
+        setUserVote(null);
+        setVotes(prev => ({ ...prev, [option]: Math.max(0, (prev[option] || 1) - 1) }));
+        toast.success('Vote removed.');
+      } else {
+        // Remove old vote if any
+        if (userVote) {
+          await supabase.from('property_votes').delete().match({ property_id: id, voter_id: user.id });
+        }
+        await supabase.from('property_votes').insert({ property_id: id, voter_id: user.id, vote_option: option });
+        setVotes(prev => {
+          const next = { ...prev };
+          if (userVote) next[userVote] = Math.max(0, (next[userVote] || 1) - 1);
+          next[option] = (next[option] || 0) + 1;
+          return next;
+        });
+        setUserVote(option);
+        toast.success('Vote submitted!');
+      }
+    } catch (err) {
+      toast.error(`Vote failed: ${(err as Error).message}`);
+    } finally {
+      setVotingFor(null);
+    }
+  };
+
+  const handleComment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) { toast.error('Sign in to comment.'); navigate('/login'); return; }
+    if (!commentText.trim()) return;
+    setCommenting(true);
+    try {
+      const { data, error } = await supabase
+        .from('property_comments')
+        .insert({ property_id: id, author_id: user.id, content: commentText.trim() })
+        .select('*, author:profiles(id, username, role)')
+        .single();
+      if (error) throw error;
+      setComments(prev => [...prev, data]);
+      setCommentText('');
+      toast.success('Comment added.');
+    } catch (err) {
+      toast.error(`Failed to comment: ${(err as Error).message}`);
+    } finally {
+      setCommenting(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <MainLayout>
+        <div className="max-w-4xl mx-auto px-4 md:px-8 py-8 space-y-4">
+          <Skeleton className="h-8 w-48 bg-muted" />
+          <Skeleton className="h-64 bg-muted" />
+          <Skeleton className="h-48 bg-muted" />
+        </div>
+      </MainLayout>
+    );
+  }
+
+  if (!property) {
+    return (
+      <MainLayout>
+        <div className="max-w-xl mx-auto px-4 py-16 text-center">
+          <Building2 className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+          <h2 className="text-xl font-semibold mb-2">Property Not Found</h2>
+          <Button onClick={() => navigate('/map')}>Browse Map</Button>
+        </div>
+      </MainLayout>
+    );
+  }
+
+  const images = property.property_images || [];
+  const alerts = (property.property_alerts || []).filter(a => !a.is_resolved);
+  const totalVotes = Object.values(votes).reduce((a, b) => a + b, 0);
+  const canVote = ['verified_vacant', 'notice_sent', 'owner_response', 'action_recommended'].includes(property.status);
+
+  return (
+    <MainLayout>
+      <div className="max-w-4xl mx-auto px-4 md:px-8 py-6 space-y-6">
+        {/* Back */}
+        <Button variant="ghost" size="sm" className="gap-1.5 -ml-2" onClick={() => navigate(-1)}>
+          <ArrowLeft className="w-4 h-4" /> Back
+        </Button>
+
+        {/* Header */}
+        <div className="flex flex-col md:flex-row md:items-start gap-4">
+          <div className="flex-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              <Badge className={`text-xs border ${getStatusColor(property.status)}`}>
+                {STATUS_LABELS[property.status]}
+              </Badge>
+              <Badge variant="outline" className="text-xs capitalize">{property.property_type}</Badge>
+              {alerts.length > 0 && (
+                <Badge className="text-xs bg-red-100 text-red-800 border-red-200 gap-1">
+                  <AlertTriangle className="w-3 h-3" />
+                  {alerts.length} Alert{alerts.length !== 1 ? 's' : ''}
+                </Badge>
+              )}
+            </div>
+            <h1 className="text-xl md:text-2xl font-bold text-foreground text-balance">{property.address}</h1>
+            <div className="flex flex-wrap items-center gap-3 mt-2 text-xs text-muted-foreground">
+              <div className="flex items-center gap-1">
+                <Calendar className="w-3.5 h-3.5" />
+                Reported {formatDate(property.created_at)}
+              </div>
+              {property.years_unused && (
+                <div className="flex items-center gap-1">
+                  <Clock className="w-3.5 h-3.5" />
+                  ~{property.years_unused} year{property.years_unused !== 1 ? 's' : ''} unused
+                </div>
+              )}
+              <div className="flex items-center gap-1">
+                <User className="w-3.5 h-3.5" />
+                {property.is_anonymous ? 'Anonymous Citizen' : 'Citizen Reporter'}
+              </div>
+            </div>
+          </div>
+          {/* Impact Score */}
+          <div className="shrink-0 text-center bg-muted border border-border rounded p-4 min-w-[100px]">
+            <p className="text-xs text-muted-foreground mb-1">Impact Score</p>
+            <p className={`text-3xl font-bold ${getImpactScoreColor(property.impact_score)}`}>
+              {property.impact_score}
+            </p>
+            <p className="text-xs text-muted-foreground">/100</p>
+          </div>
+        </div>
+
+        {/* Alerts */}
+        {alerts.length > 0 && (
+          <div className="space-y-2">
+            {alerts.map(alert => (
+              <div key={alert.id} className="flex items-start gap-3 bg-red-50 border border-red-200 rounded p-3">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-red-900 text-balance">{alert.title}</p>
+                  <p className="text-xs text-red-700 text-pretty capitalize">Severity: {alert.severity}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {/* Left Column */}
+          <div className="md:col-span-2 space-y-6">
+            {/* Photo Gallery */}
+            {images.length > 0 && (
+              <Card className="border border-border">
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-base text-balance">Photos</CardTitle>
+                </CardHeader>
+                <CardContent className="p-4 pt-0">
+                  <div className={`grid gap-2 ${images.length === 1 ? 'grid-cols-1' : 'grid-cols-2 md:grid-cols-3'}`}>
+                    {images.map((img, i) => (
+                      <div key={img.id} className="aspect-video overflow-hidden rounded border border-border">
+                        <img
+                          src={img.image_url}
+                          alt={`Property photo ${i + 1}`}
+                          className="w-full h-full object-cover hover:scale-105 transition-transform duration-300"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Details */}
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base text-balance">Property Details</CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0 space-y-4">
+                <div className="grid grid-cols-2 gap-4 text-sm">
+                  <div>
+                    <p className="text-xs text-muted-foreground">Type</p>
+                    <p className="font-medium capitalize">{property.property_type}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted-foreground">Condition</p>
+                    <p className={`font-medium capitalize ${getConditionColor(property.condition)}`}>{property.condition}</p>
+                  </div>
+                  {property.ai_confidence_score !== null && (
+                    <div>
+                      <p className="text-xs text-muted-foreground">AI Confidence</p>
+                      <p className="font-medium">{property.ai_confidence_score}%</p>
+                    </div>
+                  )}
+                  <div>
+                    <p className="text-xs text-muted-foreground">Last Updated</p>
+                    <p className="font-medium">{formatDate(property.updated_at)}</p>
+                  </div>
+                </div>
+
+                {property.safety_concerns.length > 0 && (
+                  <>
+                    <Separator />
+                    <div>
+                      <p className="text-xs text-muted-foreground mb-2">Safety Concerns</p>
+                      <div className="flex flex-wrap gap-1">
+                        {property.safety_concerns.map(c => (
+                          <Badge key={c} variant="outline" className="text-xs">
+                            {SAFETY_CONCERN_LABELS[c] || c}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {property.ai_analysis && (
+                  <>
+                    <Separator />
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <Shield className="w-4 h-4 text-primary shrink-0" />
+                        <p className="text-xs font-medium text-foreground">AI Analysis</p>
+                      </div>
+                      <p className="text-sm text-muted-foreground text-pretty">{property.ai_analysis}</p>
+                    </div>
+                  </>
+                )}
+
+                {property.potential_uses && (
+                  <>
+                    <Separator />
+                    <div>
+                      <p className="text-xs text-muted-foreground mb-1">Suggested Uses</p>
+                      <p className="text-sm text-foreground text-pretty">{property.potential_uses}</p>
+                    </div>
+                  </>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Mini Map */}
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2 text-balance">
+                  <MapPin className="w-4 h-4 text-primary" /> Location
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0">
+                <div className="h-48 rounded border border-border overflow-hidden">
+                  <MapContainer
+                    center={[property.latitude, property.longitude]}
+                    zoom={15}
+                    className="w-full h-full"
+                    zoomControl={false}
+                    dragging={false}
+                    scrollWheelZoom={false}
+                  >
+                    <TileLayer
+                      attribution='&copy; OpenStreetMap contributors'
+                      url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    />
+                    <CircleMarker
+                      center={[property.latitude, property.longitude]}
+                      radius={10}
+                      pathOptions={{
+                        color: getStatusDotColor(property.status),
+                        fillColor: getStatusDotColor(property.status),
+                        fillOpacity: 0.8,
+                        weight: 2,
+                      }}
+                    />
+                  </MapContainer>
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">
+                  {property.latitude.toFixed(5)}, {property.longitude.toFixed(5)}
+                </p>
+              </CardContent>
+            </Card>
+
+            {/* Community Voting */}
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2 text-balance">
+                  <ThumbsUp className="w-4 h-4 text-primary" />
+                  Community Vote — How Should This Space Be Used?
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0 space-y-3">
+                {!canVote && (
+                  <p className="text-xs text-muted-foreground bg-muted rounded p-2 text-pretty">
+                    Voting is available once the property is verified. Current status: {STATUS_LABELS[property.status]}.
+                  </p>
+                )}
+                <div className="space-y-2">
+                  {VOTE_OPTIONS.map(option => {
+                    const count = votes[option] || 0;
+                    const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
+                    const isSelected = userVote === option;
+                    return (
+                      <button
+                        key={option}
+                        disabled={!canVote || !user || votingFor !== null}
+                        onClick={() => handleVote(option)}
+                        className={`w-full rounded border text-left px-3 py-2 transition-colors relative overflow-hidden
+                          ${isSelected ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}
+                          ${!canVote || !user ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        <div
+                          className="absolute inset-0 bg-primary/5 transition-all"
+                          style={{ width: `${pct}%` }}
+                        />
+                        <div className="relative flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium text-foreground">{VOTE_OPTION_LABELS[option]}</span>
+                          <div className="flex items-center gap-2 shrink-0">
+                            {isSelected && <CheckCircle2 className="w-4 h-4 text-primary" />}
+                            <span className="text-xs text-muted-foreground">{count} vote{count !== 1 ? 's' : ''}</span>
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {totalVotes} total vote{totalVotes !== 1 ? 's' : ''}
+                  {!user && canVote && <span> · <button className="text-primary underline" onClick={() => navigate('/login')}>Sign in to vote</button></span>}
+                </p>
+              </CardContent>
+            </Card>
+
+            {/* Comments */}
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base flex items-center gap-2 text-balance">
+                  <MessageSquare className="w-4 h-4 text-primary" />
+                  Comments ({comments.length})
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0 space-y-4">
+                {comments.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No comments yet. Be the first to contribute.</p>
+                ) : (
+                  <div className="space-y-3">
+                    {comments.map(c => (
+                      <div key={c.id} className="flex items-start gap-3">
+                        <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                          <User className="w-4 h-4 text-primary" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-0.5">
+                            <span className="text-xs font-medium text-foreground">
+                              {(c.author as any)?.username || 'User'}
+                            </span>
+                            {(c.author as any)?.role === 'admin' && (
+                              <Badge className="text-[10px] h-4 bg-primary/10 text-primary border-primary/20 px-1">Admin</Badge>
+                            )}
+                            <span className="text-xs text-muted-foreground">{formatDateTime(c.created_at)}</span>
+                          </div>
+                          <p className="text-sm text-foreground text-pretty">{c.content}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {user ? (
+                  <form onSubmit={handleComment} className="space-y-2 pt-2 border-t border-border">
+                    <Textarea
+                      placeholder="Add a comment…"
+                      value={commentText}
+                      onChange={e => setCommentText(e.target.value)}
+                      rows={2}
+                    />
+                    <Button type="submit" size="sm" disabled={commenting || !commentText.trim()}>
+                      {commenting ? 'Posting…' : 'Post Comment'}
+                    </Button>
+                  </form>
+                ) : (
+                  <p className="text-xs text-muted-foreground pt-2 border-t border-border">
+                    <button className="text-primary underline" onClick={() => navigate('/login')}>Sign in</button> to comment.
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Right Column — Status Timeline */}
+          <div className="space-y-4">
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base text-balance">Status Timeline</CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0">
+                <div className="space-y-3">
+                  {STATUS_ORDER.map((status, i) => {
+                    const histEntry = history.find(h => h.new_status === status);
+                    const isCompleted = STATUS_ORDER.indexOf(property.status) >= i;
+                    const isCurrent = property.status === status;
+                    return (
+                      <div key={status} className="flex items-start gap-3">
+                        <div className="flex flex-col items-center shrink-0">
+                          <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center
+                            ${isCurrent ? 'border-primary bg-primary' : isCompleted ? 'border-primary bg-primary/20' : 'border-border bg-background'}`}>
+                            {isCompleted && !isCurrent && <CheckCircle2 className="w-3.5 h-3.5 text-primary" />}
+                            {isCurrent && <div className="w-2 h-2 rounded-full bg-primary-foreground" />}
+                          </div>
+                          {i < STATUS_ORDER.length - 1 && (
+                            <div className={`w-0.5 h-6 mt-1 ${isCompleted ? 'bg-primary/40' : 'bg-border'}`} />
+                          )}
+                        </div>
+                        <div className="pb-3 min-w-0 flex-1">
+                          <p className={`text-xs font-medium text-balance ${isCurrent ? 'text-foreground' : isCompleted ? 'text-foreground' : 'text-muted-foreground'}`}>
+                            {STATUS_LABELS[status]}
+                          </p>
+                          {histEntry && (
+                            <>
+                              <p className="text-xs text-muted-foreground">{formatDate(histEntry.created_at)}</p>
+                              {histEntry.notes && (
+                                <p className="text-xs text-muted-foreground mt-0.5 text-pretty">{histEntry.notes}</p>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Quick stats */}
+            <Card className="border border-border">
+              <CardContent className="p-4 space-y-3">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">AI Confidence</span>
+                  <span className="font-semibold">{property.ai_confidence_score ?? 'N/A'}{property.ai_confidence_score !== null ? '%' : ''}</span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Community Votes</span>
+                  <span className="font-semibold">{totalVotes}</span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Comments</span>
+                  <span className="font-semibold">{comments.length}</span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Active Alerts</span>
+                  <span className={`font-semibold ${alerts.length > 0 ? 'text-destructive' : ''}`}>{alerts.length}</span>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </MainLayout>
+  );
+}

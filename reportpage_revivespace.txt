@@ -1,0 +1,627 @@
+import { useState, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { supabase } from '@/db/supabase';
+import { useAuth } from '@/contexts/AuthContext';
+import MainLayout from '@/components/layouts/MainLayout';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Switch } from '@/components/ui/switch';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Progress } from '@/components/ui/progress';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import { Separator } from '@/components/ui/separator';
+import {
+  Upload, X, MapPin, AlertTriangle, Loader2, CheckCircle2,
+  Building2, Shield, Camera, Info,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { SAFETY_CONCERN_LABELS, type PropertyCondition, type PropertyType } from '@/types/types';
+import { compressImage } from '@/lib/utils-app';
+import { MapContainer, TileLayer, Marker, useMapEvents } from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+
+// Fix leaflet default icon
+delete (L.Icon.Default.prototype as any)._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
+
+function LocationPicker({ position, onChange }: { position: [number, number] | null; onChange: (p: [number, number]) => void }) {
+  useMapEvents({ click(e) { onChange([e.latlng.lat, e.latlng.lng]); } });
+  return position ? <Marker position={position} /> : null;
+}
+
+interface AIResult {
+  confidence_score: number;
+  condition: PropertyCondition;
+  detected_issues: string[];
+  analysis: string;
+}
+
+interface ImageFile {
+  file: File;
+  preview: string;
+  uploading: boolean;
+  uploadProgress: number;
+  url?: string;
+  compressed?: boolean;
+  finalSize?: number;
+}
+
+const SAFETY_CONCERNS = Object.keys(SAFETY_CONCERN_LABELS);
+
+export default function ReportPage() {
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  const [step, setStep] = useState(1);
+  const [isAnonymous, setIsAnonymous] = useState(false);
+  const [propertyType, setPropertyType] = useState<PropertyType>('residential');
+  const [condition, setCondition] = useState<PropertyCondition>('fair');
+  const [yearsUnused, setYearsUnused] = useState('');
+  const [address, setAddress] = useState('');
+  const [potentialUses, setPotentialUses] = useState('');
+  const [safetyConcerns, setSafetyConcerns] = useState<string[]>([]);
+  const [position, setPosition] = useState<[number, number] | null>(null);
+  const [images, setImages] = useState<ImageFile[]>([]);
+  const [aiResult, setAiResult] = useState<AIResult | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  if (!user) {
+    return (
+      <MainLayout>
+        <div className="max-w-xl mx-auto px-4 py-16 text-center">
+          <Shield className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+          <h2 className="text-xl font-semibold mb-2 text-balance">Sign In Required</h2>
+          <p className="text-muted-foreground mb-6 text-pretty">You need to be signed in to report a property.</p>
+          <Button onClick={() => navigate('/login')}>Sign In</Button>
+        </div>
+      </MainLayout>
+    );
+  }
+
+  const toggleSafetyConcern = (concern: string) => {
+    setSafetyConcerns(prev =>
+      prev.includes(concern) ? prev.filter(c => c !== concern) : [...prev, concern]
+    );
+  };
+
+  const handleFiles = async (files: FileList | null) => {
+    if (!files) return;
+    const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'];
+    const newImages: ImageFile[] = [];
+
+    for (const file of Array.from(files)) {
+      if (!allowed.includes(file.type)) {
+        toast.error(`${file.name}: unsupported format.`);
+        continue;
+      }
+      if (images.length + newImages.length >= 5) {
+        toast.warning('Maximum 5 images allowed.');
+        break;
+      }
+      const preview = URL.createObjectURL(file);
+      newImages.push({ file, preview, uploading: false, uploadProgress: 0 });
+    }
+    setImages(prev => [...prev, ...newImages]);
+  };
+
+  const removeImage = (index: number) => {
+    setImages(prev => {
+      URL.revokeObjectURL(prev[index].preview);
+      return prev.filter((_, i) => i !== index);
+    });
+  };
+
+  const analyzeImages = async () => {
+    if (images.length === 0) {
+      toast.error('Please upload at least one photo first.');
+      return;
+    }
+    setAnalyzing(true);
+    try {
+      const img = images[0];
+      const reader = new FileReader();
+      const base64 = await new Promise<string>((res, rej) => {
+        reader.onload = e => {
+          const result = (e.target?.result as string).split(',')[1];
+          res(result);
+        };
+        reader.onerror = rej;
+        reader.readAsDataURL(img.file);
+      });
+
+      const { data, error } = await supabase.functions.invoke('analyze-property', {
+        body: { imageBase64: base64, mimeType: img.file.type },
+      });
+
+      if (error) {
+        const msg = await error?.context?.text?.();
+        throw new Error(msg || error.message);
+      }
+
+      setAiResult(data);
+      if (data?.condition) setCondition(data.condition);
+      toast.success('AI analysis complete!');
+    } catch (err) {
+      toast.error(`AI analysis failed: ${(err as Error).message}`);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const uploadImages = async (propertyId: string) => {
+    const updatedImages = [...images];
+    for (let i = 0; i < updatedImages.length; i++) {
+      const img = updatedImages[i];
+      updatedImages[i] = { ...img, uploading: true, uploadProgress: 0 };
+      setImages([...updatedImages]);
+
+      try {
+        let fileToUpload = img.file;
+        let compressed = false;
+        let finalSize = img.file.size;
+
+        if (img.file.size > 1024 * 1024) {
+          fileToUpload = await compressImage(img.file);
+          compressed = true;
+          finalSize = fileToUpload.size;
+          toast.info(`Image compressed to ${(finalSize / 1024).toFixed(0)} KB`);
+        }
+
+        const safeFilename = fileToUpload.name.replace(/[^a-zA-Z0-9.]/g, '_');
+        const path = `${propertyId}/${Date.now()}_${safeFilename}`;
+
+        const { data: uploadData, error: uploadError } = await supabase.storage
+          .from('property-images')
+          .upload(path, fileToUpload, { contentType: fileToUpload.type });
+
+        if (uploadError) throw uploadError;
+
+        const { data: urlData } = supabase.storage
+          .from('property-images')
+          .getPublicUrl(uploadData.path);
+
+        await supabase.from('property_images').insert({
+          property_id: propertyId,
+          image_url: urlData.publicUrl,
+        });
+
+        updatedImages[i] = { ...updatedImages[i], uploading: false, uploadProgress: 100, url: urlData.publicUrl, compressed, finalSize };
+        setImages([...updatedImages]);
+      } catch (err) {
+        updatedImages[i] = { ...updatedImages[i], uploading: false, uploadProgress: 0 };
+        setImages([...updatedImages]);
+        toast.error(`Failed to upload image ${i + 1}`);
+      }
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!address.trim()) { toast.error('Please enter the property address.'); return; }
+    if (!position) { toast.error('Please mark the property location on the map.'); return; }
+
+    setSubmitting(true);
+    try {
+      const impactScore = Math.min(100, Math.round(
+        (condition === 'poor' ? 40 : condition === 'fair' ? 20 : 10) +
+        (safetyConcerns.length * 5) +
+        (aiResult?.confidence_score ? aiResult.confidence_score * 0.3 : 15) +
+        (yearsUnused ? Math.min(parseInt(yearsUnused), 10) * 2 : 5)
+      ));
+
+      const { data: property, error } = await supabase
+        .from('properties')
+        .insert({
+          reporter_id: isAnonymous ? null : user.id,
+          is_anonymous: isAnonymous,
+          property_type: propertyType,
+          condition,
+          years_unused: yearsUnused ? parseInt(yearsUnused) : null,
+          address: address.trim(),
+          latitude: position[0],
+          longitude: position[1],
+          safety_concerns: safetyConcerns,
+          potential_uses: potentialUses.trim() || null,
+          status: 'reported',
+          ai_confidence_score: aiResult?.confidence_score ?? null,
+          ai_analysis: aiResult?.analysis ?? null,
+          impact_score: impactScore,
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      // Insert initial status history
+      await supabase.from('property_status_history').insert({
+        property_id: property.id,
+        old_status: null,
+        new_status: 'reported',
+        changed_by: isAnonymous ? null : user.id,
+        notes: 'Property reported by citizen.',
+      });
+
+      await uploadImages(property.id);
+
+      toast.success('Property reported successfully!');
+      navigate(`/property/${property.id}`);
+    } catch (err) {
+      toast.error(`Failed to submit report: ${(err as Error).message}`);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <MainLayout>
+      <div className="max-w-3xl mx-auto px-4 md:px-8 py-8">
+        {/* Header */}
+        <div className="mb-6">
+          <h1 className="text-2xl font-bold text-foreground text-balance">Report Abandoned Property</h1>
+          <p className="text-sm text-muted-foreground mt-1 text-pretty">
+            Help your community by documenting unused properties. All reports are reviewed by local authorities.
+          </p>
+        </div>
+
+        {/* Steps Progress */}
+        <div className="flex items-center gap-2 mb-8">
+          {[1, 2, 3].map(s => (
+            <div key={s} className="flex items-center gap-2 flex-1 min-w-0">
+              <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 border-2 transition-colors
+                ${step >= s ? 'bg-primary text-primary-foreground border-primary' : 'border-border text-muted-foreground'}`}>
+                {step > s ? <CheckCircle2 className="w-4 h-4" /> : s}
+              </div>
+              <span className={`text-xs hidden sm:block text-balance ${step >= s ? 'text-foreground font-medium' : 'text-muted-foreground'}`}>
+                {s === 1 ? 'Property Info' : s === 2 ? 'Location & Photos' : 'Review & Submit'}
+              </span>
+              {s < 3 && <div className={`flex-1 h-0.5 ${step > s ? 'bg-primary' : 'bg-border'}`} />}
+            </div>
+          ))}
+        </div>
+
+        {/* Step 1: Property Info */}
+        {step === 1 && (
+          <div className="space-y-5">
+            {/* Anonymous toggle */}
+            <Card className="border border-border">
+              <CardContent className="p-4 flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="font-medium text-sm text-foreground">Anonymous Report</p>
+                  <p className="text-xs text-muted-foreground text-pretty">Your identity will be hidden from public view</p>
+                </div>
+                <Switch checked={isAnonymous} onCheckedChange={setIsAnonymous} />
+              </CardContent>
+            </Card>
+
+            {/* Property Type */}
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Property Type</Label>
+              <RadioGroup value={propertyType} onValueChange={v => setPropertyType(v as PropertyType)} className="flex gap-4">
+                <div className="flex items-center gap-2 min-h-12">
+                  <RadioGroupItem value="residential" id="residential" />
+                  <Label htmlFor="residential" className="text-sm cursor-pointer">Residential</Label>
+                </div>
+                <div className="flex items-center gap-2 min-h-12">
+                  <RadioGroupItem value="commercial" id="commercial" />
+                  <Label htmlFor="commercial" className="text-sm cursor-pointer">Commercial</Label>
+                </div>
+              </RadioGroup>
+            </div>
+
+            {/* Condition */}
+            <div className="space-y-2">
+              <Label htmlFor="condition" className="text-sm font-normal">Current Condition</Label>
+              <Select value={condition} onValueChange={v => setCondition(v as PropertyCondition)}>
+                <SelectTrigger id="condition">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="poor">Poor — Severe deterioration, safety hazard</SelectItem>
+                  <SelectItem value="fair">Fair — Noticeable neglect, moderate damage</SelectItem>
+                  <SelectItem value="good">Good — Minor cosmetic issues only</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Years Unused */}
+            <div className="space-y-2">
+              <Label htmlFor="years" className="text-sm font-normal">Approximate Years Unused</Label>
+              <Input
+                id="years"
+                type="number"
+                min="0"
+                max="100"
+                placeholder="e.g. 3"
+                value={yearsUnused}
+                onChange={e => setYearsUnused(e.target.value)}
+              />
+            </div>
+
+            {/* Safety Concerns */}
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Safety Concerns</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {SAFETY_CONCERNS.map(concern => (
+                  <div key={concern} className="flex items-center gap-2 min-h-12">
+                    <Checkbox
+                      id={concern}
+                      checked={safetyConcerns.includes(concern)}
+                      onCheckedChange={() => toggleSafetyConcern(concern)}
+                    />
+                    <label htmlFor={concern} className="text-sm cursor-pointer text-balance">
+                      {SAFETY_CONCERN_LABELS[concern]}
+                    </label>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Potential Uses */}
+            <div className="space-y-2">
+              <Label htmlFor="uses" className="text-sm font-normal">Suggested Potential Uses (optional)</Label>
+              <Textarea
+                id="uses"
+                placeholder="e.g. Community garden, affordable housing, health clinic..."
+                value={potentialUses}
+                onChange={e => setPotentialUses(e.target.value)}
+                rows={2}
+              />
+            </div>
+
+            <Button className="w-full" onClick={() => setStep(2)}>
+              Next: Location & Photos
+            </Button>
+          </div>
+        )}
+
+        {/* Step 2: Location & Photos */}
+        {step === 2 && (
+          <div className="space-y-5">
+            {/* Address */}
+            <div className="space-y-2">
+              <Label htmlFor="address" className="text-sm font-normal">
+                Property Address <span className="text-destructive">*</span>
+              </Label>
+              <div className="relative">
+                <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                <Input
+                  id="address"
+                  className="pl-9"
+                  placeholder="Street address or nearest intersection"
+                  value={address}
+                  onChange={e => setAddress(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {/* Map */}
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">
+                Pin Location on Map <span className="text-destructive">*</span>
+              </Label>
+              <p className="text-xs text-muted-foreground">Click on the map to mark the property location.</p>
+              <div className="h-64 rounded border border-border overflow-hidden">
+                <MapContainer center={[40.72, -73.99]} zoom={13} className="w-full h-full">
+                  <TileLayer
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                  />
+                  <LocationPicker position={position} onChange={setPosition} />
+                </MapContainer>
+              </div>
+              {position && (
+                <p className="text-xs text-muted-foreground">
+                  Selected: {position[0].toFixed(5)}, {position[1].toFixed(5)}
+                </p>
+              )}
+            </div>
+
+            {/* Photo Upload */}
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Property Photos</Label>
+              <p className="text-xs text-muted-foreground">
+                Upload up to 5 photos (JPEG, PNG, WEBP). Max 1 MB each — auto-compressed if larger.
+              </p>
+
+              <div
+                className="border-2 border-dashed border-border rounded-lg p-6 text-center cursor-pointer hover:border-primary/50 transition-colors"
+                onClick={() => fileInputRef.current?.click()}
+                onDragOver={e => e.preventDefault()}
+                onDrop={e => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
+              >
+                <Camera className="w-8 h-8 text-muted-foreground mx-auto mb-2" />
+                <p className="text-sm text-muted-foreground">
+                  <span className="text-primary font-medium">Click to upload</span> or drag and drop
+                </p>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/gif,image/webp,image/avif"
+                  multiple
+                  className="hidden"
+                  onChange={e => handleFiles(e.target.files)}
+                />
+              </div>
+
+              {images.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 mt-2">
+                  {images.map((img, i) => (
+                    <div key={i} className="relative aspect-square rounded overflow-hidden border border-border group">
+                      <img src={img.preview} alt={`Upload ${i + 1}`} className="w-full h-full object-cover" />
+                      {img.uploading && (
+                        <div className="absolute inset-0 bg-background/70 flex flex-col items-center justify-center gap-1">
+                          <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                          <Progress value={img.uploadProgress} className="w-4/5 h-1" />
+                        </div>
+                      )}
+                      {!img.uploading && (
+                        <button
+                          onClick={() => removeImage(i)}
+                          className="absolute top-1 right-1 w-6 h-6 rounded-full bg-background/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* AI Analysis */}
+              {images.length > 0 && (
+                <div className="mt-2">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="gap-2 w-full"
+                    onClick={analyzeImages}
+                    disabled={analyzing}
+                  >
+                    {analyzing ? (
+                      <><Loader2 className="w-4 h-4 animate-spin" /> Analyzing with AI…</>
+                    ) : (
+                      <><Shield className="w-4 h-4" /> Analyze with AI</>
+                    )}
+                  </Button>
+                </div>
+              )}
+
+              {aiResult && (
+                <Card className="border border-primary/30 bg-primary/5">
+                  <CardContent className="p-4 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Shield className="w-4 h-4 text-primary shrink-0" />
+                      <span className="text-sm font-semibold text-foreground">AI Analysis Result</span>
+                      <Badge className="ml-auto text-xs bg-primary/10 text-primary border-primary/30">
+                        {aiResult.confidence_score}% Confidence
+                      </Badge>
+                    </div>
+                    <p className="text-sm text-muted-foreground text-pretty">{aiResult.analysis}</p>
+                    {aiResult.detected_issues.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {aiResult.detected_issues.map((issue, i) => (
+                          <Badge key={i} variant="outline" className="text-xs">{issue}</Badge>
+                        ))}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+
+            <div className="flex gap-3">
+              <Button variant="outline" className="flex-1" onClick={() => setStep(1)}>Back</Button>
+              <Button className="flex-1" onClick={() => setStep(3)}>Next: Review</Button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 3: Review & Submit */}
+        {step === 3 && (
+          <div className="space-y-5">
+            <Card className="border border-border">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base text-balance">Review Your Report</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div>
+                    <p className="text-muted-foreground text-xs">Property Type</p>
+                    <p className="font-medium capitalize">{propertyType}</p>
+                  </div>
+                  <div>
+                    <p className="text-muted-foreground text-xs">Condition</p>
+                    <p className="font-medium capitalize">{condition}</p>
+                  </div>
+                  <div>
+                    <p className="text-muted-foreground text-xs">Years Unused</p>
+                    <p className="font-medium">{yearsUnused || 'Not specified'}</p>
+                  </div>
+                  <div>
+                    <p className="text-muted-foreground text-xs">Anonymous</p>
+                    <p className="font-medium">{isAnonymous ? 'Yes' : 'No'}</p>
+                  </div>
+                </div>
+
+                <Separator />
+
+                <div>
+                  <p className="text-muted-foreground text-xs mb-1">Address</p>
+                  <p className="text-sm font-medium">{address}</p>
+                </div>
+
+                {position && (
+                  <div>
+                    <p className="text-muted-foreground text-xs mb-1">Coordinates</p>
+                    <p className="text-sm font-mono">{position[0].toFixed(5)}, {position[1].toFixed(5)}</p>
+                  </div>
+                )}
+
+                {safetyConcerns.length > 0 && (
+                  <div>
+                    <p className="text-muted-foreground text-xs mb-1">Safety Concerns</p>
+                    <div className="flex flex-wrap gap-1">
+                      {safetyConcerns.map(c => (
+                        <Badge key={c} variant="outline" className="text-xs">{SAFETY_CONCERN_LABELS[c]}</Badge>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {images.length > 0 && (
+                  <div>
+                    <p className="text-muted-foreground text-xs mb-2">{images.length} photo{images.length !== 1 ? 's' : ''} attached</p>
+                    <div className="flex gap-2 flex-wrap">
+                      {images.map((img, i) => (
+                        <img key={i} src={img.preview} alt="" className="w-12 h-12 object-cover rounded border border-border" />
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {aiResult && (
+                  <div className="flex items-start gap-2 bg-primary/5 rounded p-3 border border-primary/20">
+                    <Info className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+                    <p className="text-xs text-muted-foreground text-pretty">
+                      AI analysis will be attached: {aiResult.confidence_score}% abandonment confidence.
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            <div className="flex items-start gap-2 bg-[hsl(var(--warning)/0.1)] border border-[hsl(var(--warning)/0.3)] rounded p-3">
+              <AlertTriangle className="w-4 h-4 text-[hsl(var(--warning))] shrink-0 mt-0.5" />
+              <p className="text-xs text-muted-foreground text-pretty">
+                By submitting, you confirm this report is accurate to the best of your knowledge.
+                False reports may result in account suspension.
+              </p>
+            </div>
+
+            <div className="flex gap-3">
+              <Button variant="outline" className="flex-1" onClick={() => setStep(2)} disabled={submitting}>Back</Button>
+              <Button className="flex-1 gap-2" onClick={handleSubmit} disabled={submitting}>
+                {submitting ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Submitting…</>
+                ) : (
+                  <><Building2 className="w-4 h-4" /> Submit Report</>
+                )}
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </MainLayout>
+  );
+}
